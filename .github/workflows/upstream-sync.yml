@@ -1,0 +1,160 @@
+name: Upstream Sync
+
+# Reusable workflow: run a "sync" command in the caller repo, and if it produces
+# file changes (i.e. upstream drift), open or update a pull request with the diff.
+#
+# Exit-code contract: the sync command MAY exit non-zero to signal "drift found"
+# (e.g. scripts/sync_upstreams.py --apply exits 1 when changes exist). This
+# workflow therefore decides success/failure from the git working tree, not the
+# command's exit code:
+#   - changes present              -> open/update PR, job succeeds
+#   - no changes, exit 0           -> nothing to do, job succeeds
+#   - no changes, exit non-zero    -> treated as a real failure, job fails
+#
+# Usage: see README.md.
+
+on:
+  workflow_call:
+    inputs:
+      sync-command:
+        description: "Command that applies upstream changes to the working tree."
+        required: true
+        type: string
+      python-version:
+        description: "Python version to set up (ignored when setup-python is false)."
+        required: false
+        type: string
+        default: "3.11"
+      setup-python:
+        description: "Whether to set up Python before running the sync command."
+        required: false
+        type: boolean
+        default: true
+      pip-packages:
+        description: "Space-separated pip packages to install (empty = skip)."
+        required: false
+        type: string
+        default: ""
+      pr-base:
+        description: "Base branch the PR targets."
+        required: false
+        type: string
+        default: "main"
+      pr-branch:
+        description: "Head branch the PR is created from."
+        required: false
+        type: string
+        default: "chore/upstream-sync"
+      commit-message:
+        description: "Commit message for the sync commit."
+        required: false
+        type: string
+        default: "chore(sync): refresh upstream sources"
+      pr-title:
+        description: "Title of the pull request."
+        required: false
+        type: string
+        default: "chore(sync): upstream drift detected"
+      pr-labels:
+        description: "Comma-separated labels applied to the PR."
+        required: false
+        type: string
+        default: "automated,upstream-sync"
+    secrets:
+      GH_PAT:
+        description: "Optional PAT used to open the PR. Falls back to GITHUB_TOKEN. Use a PAT if you want the PR to trigger other workflows (e.g. validation)."
+        required: false
+
+concurrency:
+  group: upstream-sync-${{ github.repository }}-${{ inputs.pr-branch }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        if: ${{ inputs.setup-python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install pip packages
+        if: ${{ inputs.setup-python && inputs.pip-packages != '' }}
+        env:
+          PIP_PACKAGES: ${{ inputs.pip-packages }}
+        run: pip install $PIP_PACKAGES
+
+      - name: Run sync command
+        id: sync
+        shell: bash
+        env:
+          SYNC_COMMAND: ${{ inputs.sync-command }}
+        run: |
+          set +e
+          set +o pipefail
+          bash -c "$SYNC_COMMAND" 2>&1 | tee /tmp/sync-output.log
+          code="${PIPESTATUS[0]}"
+          echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+          echo "Sync command exited with code $code"
+
+      - name: Detect working-tree changes
+        id: changes
+        shell: bash
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Working-tree changes detected."
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No working-tree changes."
+          fi
+
+      - name: Fail on sync error
+        if: ${{ steps.changes.outputs.changed == 'false' && steps.sync.outputs.exit-code != '0' }}
+        shell: bash
+        run: |
+          echo "::error::Sync command exited ${{ steps.sync.outputs.exit-code }} with no file changes — treating as a real failure."
+          exit 1
+
+      - name: Build PR body
+        if: ${{ steps.changes.outputs.changed == 'true' }}
+        shell: bash
+        run: |
+          {
+            echo "## Automated upstream sync"
+            echo
+            echo "Drift was detected between this repo and its upstream sources, and pulled in by:"
+            echo
+            echo '```'
+            echo "${{ inputs.sync-command }}"
+            echo '```'
+            echo
+            echo "Review the diff below before merging."
+            echo
+            echo "<details><summary>Sync log</summary>"
+            echo
+            echo '```'
+            tail -n 200 /tmp/sync-output.log
+            echo '```'
+            echo
+            echo "</details>"
+          } > /tmp/pr-body.md
+
+      - name: Create or update pull request
+        if: ${{ steps.changes.outputs.changed == 'true' }}
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GH_PAT || github.token }}
+          base: ${{ inputs.pr-base }}
+          branch: ${{ inputs.pr-branch }}
+          delete-branch: true
+          commit-message: ${{ inputs.commit-message }}
+          title: ${{ inputs.pr-title }}
+          body-path: /tmp/pr-body.md
+          labels: ${{ inputs.pr-labels }}
